@@ -1,0 +1,23 @@
+{
+  "name": "loker-bot-wa",
+  "version": "1.0.0",
+  "description": "Bot WhatsApp untuk sistem lowongan kerja",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "keywords": ["whatsapp", "bot", "job", "loker"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.0",
+    "mysql2": "^3.6.0",
+    "dotenv": "^16.3.1",
+    "pino": "^8.16.0",
+    "qrcode-terminal": "^0.12.0",
+    "mime-types": "^2.1.35",
+    "node-cache": "^5.1.2"
+  }
+}

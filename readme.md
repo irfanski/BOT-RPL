@@ -169,11 +169,4 @@ loker-bot-wa/
 ## 🤝 Contributing
 
 Feel free to contribute! Create issue atau pull request.
-
-## 📄 License
-
-ISC
-
----
-
 by irfan

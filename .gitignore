@@ -1,0 +1,18 @@
+# dependencies
+node_modules/
+
+# env
+.env
+
+# session whatsapp
+sessions/
+
+# uploads
+uploads/
+
+# logs
+*.log
+
+# OS / Editor
+.DS_Store
+.vscode/

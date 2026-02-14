@@ -47,6 +47,12 @@ import { isValidFileType, isValidFileSize, generateFileName } from '../utils/hel
 
 async function handleMessage(sock, msg) {
   const from = msg.key.remoteJid;
+  
+  // Skip status updates dan broadcast
+  if (from === 'status@broadcast' || !from.endsWith('@s.whatsapp.net')) {
+    return;
+  }
+  
   const phoneNumber = extractPhoneNumber(from);
   
   // Ekstrak pesan text
@@ -68,32 +74,60 @@ async function handleMessage(sock, msg) {
   }
 
   text = text.trim();
-  console.log(`📨 Pesan dari ${phoneNumber}: ${text}`);
+  console.log(`📨 [${phoneNumber}] Pesan: "${text}"`);
 
   try {
     // Cek apakah user sudah terdaftar
     const user = await checkUserExists(phoneNumber);
+    console.log(`👤 [${phoneNumber}] User exists:`, user ? 'YES' : 'NO');
+
+    // FITUR BARU: Cek apakah user ketik "menu" - langsung ke menu utama
+    if (text.toLowerCase() === 'menu' && user) {
+      console.log(`🏠 [${phoneNumber}] User requested main menu`);
+      clearState(phoneNumber); // Clear semua session yang sedang berjalan
+      const userData = await getUserData(user.id, user.role);
+      await showMainMenu(sock, from, userData);
+      return;
+    }
 
     // Jika belum terdaftar, mulai registrasi
     if (!user) {
+      console.log(`🆕 [${phoneNumber}] Starting registration flow`);
       await handleRegistrationFlow(sock, from, phoneNumber, text);
       return;
     }
 
-    // Jika user sedang dalam flow registrasi (edge case)
-    if (isInFlow(phoneNumber)) {
-      await handleRegistrationFlow(sock, from, phoneNumber, text);
-      return;
-    }
-
-    // User sudah terdaftar, handle menu
+    // User sudah terdaftar, ambil data user
     const userData = await getUserData(user.id, user.role);
+    console.log(`✅ [${phoneNumber}] User role: ${userData.role}`);
+
+    // Cek apakah user sedang dalam flow
+    const currentSession = getState(phoneNumber);
+    console.log(`🔄 [${phoneNumber}] Current session:`, currentSession ? currentSession.state : 'NONE');
+
+    // Jika ada session, route ke flow yang sesuai
+    if (currentSession) {
+      // Cek apakah ini flow registrasi
+      if (currentSession.state.startsWith('reg_')) {
+        console.log(`📝 [${phoneNumber}] In registration flow`);
+        await handleRegistrationFlow(sock, from, phoneNumber, text);
+      } else {
+        // Flow lainnya (posting lowongan, aplikasi, dll)
+        console.log(`🔀 [${phoneNumber}] In other flow: ${currentSession.state}`);
+        await handleFlowState(sock, from, phoneNumber, text, userData, currentSession);
+      }
+      return;
+    }
+
+    // Tidak ada session, handle menu command biasa
     await handleMenuCommand(sock, from, phoneNumber, text, userData);
 
   } catch (err) {
-    console.error('Error handling message:', err);
+    console.error(`❌ [${phoneNumber}] ERROR in handleMessage:`);
+    console.error('Error:', err.message);
+    console.error('Stack:', err.stack);
     await sock.sendMessage(from, {
-      text: 'Maaf, ada error nih. Coba lagi ya!'
+      text: `Maaf, ada error nih. Coba lagi ya!\n\n[Debug: ${err.message}]`
     });
   }
 }
@@ -166,7 +200,9 @@ async function showMainMenu(sock, from, userData) {
 2️⃣ Cek Status Lamaran
 3️⃣ Update Profil
 
-Ketik angka atau keyword untuk memilih menu.`;
+Ketik angka atau keyword untuk memilih menu.
+
+💡 _Ketik "menu" kapanpun untuk kembali ke sini_`;
     
     await sock.sendMessage(from, { text: menuText });
   } else {
@@ -176,7 +212,9 @@ Ketik angka atau keyword untuk memilih menu.`;
 2️⃣ Lihat Pelamar
 3️⃣ Kelola Lowongan
 
-Ketik angka atau keyword untuk memilih menu.`;
+Ketik angka atau keyword untuk memilih menu.
+
+💡 _Ketik "menu" kapanpun untuk kembali ke sini_`;
     
     await sock.sendMessage(from, { text: menuText });
   }
@@ -187,8 +225,13 @@ async function handleMenuCommand(sock, from, phoneNumber, text, userData) {
   const session = getState(phoneNumber);
   const lowerText = text.toLowerCase();
   
+  console.log(`🎯 [${phoneNumber}] handleMenuCommand - session:`, session ? session.state : 'NONE');
+  console.log(`🎯 [${phoneNumber}] handleMenuCommand - role:`, userData.role);
+  console.log(`🎯 [${phoneNumber}] handleMenuCommand - text:`, text);
+  
   // Jika sedang dalam flow tertentu
   if (session) {
+    console.log(`🔀 [${phoneNumber}] Routing to handleFlowState with state: ${session.state}`);
     await handleFlowState(sock, from, phoneNumber, text, userData, session);
     return;
   }
@@ -218,502 +261,354 @@ async function handleMenuCommand(sock, from, phoneNumber, text, userData) {
       // Filter lowongan by skill
       const skillName = text.substring(6).trim();
       if (!skillName) {
-        await sock.sendMessage(from, { text: 'Ketik: filter [nama skill]\nContoh: filter javascript' });
+        await sock.sendMessage(from, { text: 'Format: filter [nama skill]\n\nContoh: filter JavaScript' });
         return;
       }
       
       const lowongan = await filterLowonganBySkill(skillName);
       const listText = formatLowonganList(lowongan);
       await sock.sendMessage(from, { text: listText });
+      
       setState(phoneNumber, 'choose_lowongan', { lowongan });
       
-    } else if (lowerText.startsWith('lamar')) {
+    } else if (lowerText.startsWith('lamar ')) {
       // Lamar lowongan
-      const lowonganId = text.split(' ')[1];
-      if (!lowonganId) {
-        await sock.sendMessage(from, { text: 'Ketik: lamar [ID lowongan]\nContoh: lamar LWG001' });
+      const lowonganId = text.substring(6).trim().toUpperCase();
+      
+      // Ambil detail lowongan
+      const lowonganDetail = await getLowonganDetail(lowonganId);
+      if (!lowonganDetail) {
+        await sock.sendMessage(from, { text: 'Lowongan tidak ditemukan!' });
         return;
       }
       
-      await startApplicationProcess(sock, from, phoneNumber, lowonganId, userData);
+      // Cek apakah sudah pernah lamar
+      const pencariKerjaId = await getPencariKerjaId(userData.id);
+      const alreadyApplied = await checkExistingApplication(pencariKerjaId, lowonganId);
       
-    } else if (lowerText === 'menu' || lowerText === 'back' || lowerText === 'kembali') {
+      if (alreadyApplied) {
+        await sock.sendMessage(from, { text: 'Kamu sudah pernah lamar lowongan ini sebelumnya!' });
+        return;
+      }
+      
+      // Minta CV
+      await sock.sendMessage(from, { 
+        text: `Oke, kamu mau lamar posisi *${lowonganDetail.posisi}*!\n\nKirim CV kamu dalam format PDF/DOC ya.\n\n(Max 5MB)` 
+      });
+      
+      setState(phoneNumber, 'upload_cv', { 
+        lowonganId,
+        pencariKerjaId,
+        posisi: lowonganDetail.posisi
+      });
+      
+    } else if (lowerText === 'menu' || lowerText === 'help') {
       await showMainMenu(sock, from, userData);
       
     } else {
-      await sock.sendMessage(from, { 
-        text: 'Maaf, aku nggak ngerti 😅\n\nKetik "menu" untuk lihat pilihan yang ada ya!' 
-      });
+      await sock.sendMessage(from, { text: 'Perintah tidak dikenali. Ketik "menu" untuk lihat pilihan.' });
     }
+    
   } else {
     // Menu perusahaan
-    await handleCompanyMenu(sock, from, phoneNumber, text, userData);
-  }
-}
-
-// Handle flow state (untuk pilih lowongan, upload CV, dll)
-async function handleFlowState(sock, from, phoneNumber, text, userData, session) {
-  if (session.state === 'choose_lowongan') {
-    // User pilih lowongan dari list
-    const selectedIndex = parseInt(text) - 1;
-    const lowonganId = text.toUpperCase();
+    console.log(`🏢 [${phoneNumber}] Company menu - checking command: "${lowerText}"`);
     
-    let lowongan;
-    
-    if (!isNaN(selectedIndex) && session.data.lowongan[selectedIndex]) {
-      // Pilih by nomor
-      lowongan = await getLowonganDetail(session.data.lowongan[selectedIndex].id);
-    } else if (lowonganId.startsWith('LWG')) {
-      // Pilih by ID
-      lowongan = await getLowonganDetail(lowonganId);
-    } else {
-      await sock.sendMessage(from, { text: 'Pilih nomor atau ID lowongan yang valid ya!' });
-      return;
-    }
-    
-    if (!lowongan) {
-      await sock.sendMessage(from, { text: 'Lowongan tidak ditemukan!' });
-      clearState(phoneNumber);
-      return;
-    }
-    
-    const detailText = formatLowonganDetail(lowongan);
-    await sock.sendMessage(from, { text: detailText });
-    clearState(phoneNumber);
-    
-  } else if (session.state === 'upload_cv') {
-    // Menunggu user upload file CV
-    await sock.sendMessage(from, { 
-      text: 'Upload file CV kamu dong (PDF/DOC/DOCX).\n\nPastiin ukurannya nggak lebih dari 5MB ya!' 
-    });
-  }
-}
-
-// Start application process
-async function startApplicationProcess(sock, from, phoneNumber, lowonganId, userData) {
-  try {
-    // Validasi lowongan exists
-    const lowongan = await getLowonganDetail(lowonganId);
-    if (!lowongan) {
-      await sock.sendMessage(from, { text: 'Lowongan tidak ditemukan!' });
-      return;
-    }
-    
-    // Cek apakah sudah pernah lamar
-    const pencariKerjaId = await getPencariKerjaId(userData.id);
-    const alreadyApplied = await checkExistingApplication(pencariKerjaId, lowonganId);
-    
-    if (alreadyApplied) {
-      await sock.sendMessage(from, { 
-        text: 'Kamu udah pernah lamar posisi ini!\n\nCek status lamaranmu dengan ketik "2" atau "status".' 
-      });
-      return;
-    }
-    
-    // Minta upload CV
-    await sock.sendMessage(from, { 
-      text: `Oke gas! Kamu mau lamar posisi *${lowongan.posisi}* di ${lowongan.nama_perusahaan}.\n\nUpload CV kamu dong (PDF/DOC/DOCX max 5MB).\nPastiin CV-nya udah update ya biar HRD-nya tertarik!` 
-    });
-    
-    setState(phoneNumber, 'upload_cv', { lowonganId, pencariKerjaId });
-    
-  } catch (err) {
-    console.error('Error starting application:', err);
-    await sock.sendMessage(from, { text: 'Maaf, ada error. Coba lagi ya!' });
-  }
-}
-
-// Handle file upload
-async function handleFileUpload(sock, from, phoneNumber, msg, messageType) {
-  try {
-    const session = getState(phoneNumber);
-    
-    if (!session || session.state !== 'upload_cv') {
-      return;
-    }
-    
-    // Download media
-    const buffer = await downloadMediaMessage(msg, 'buffer', {});
-    const mediaMsg = msg.message[messageType];
-    
-    // Validasi file type
-    const mimetype = mediaMsg.mimetype;
-    if (!isValidFileType(mimetype)) {
-      await sock.sendMessage(from, { 
-        text: 'Format file tidak didukung!\n\nKirim file PDF atau DOC/DOCX ya.' 
-      });
-      return;
-    }
-    
-    // Validasi file size
-    const fileSize = buffer.length;
-    if (!isValidFileSize(fileSize)) {
-      await sock.sendMessage(from, { 
-        text: 'Ukuran file terlalu besar!\n\nMaksimal 5MB ya.' 
-      });
-      return;
-    }
-    
-    // Generate filename & save
-    const ext = mime.extension(mimetype);
-    const fileName = generateFileName(`cv_${Date.now()}.${ext}`, session.data.pencariKerjaId);
-    const uploadDir = process.env.UPLOAD_DIR || './uploads/cv';
-    const filePath = path.join(uploadDir, fileName);
-    
-    fs.writeFileSync(filePath, buffer);
-    
-    // Save to database
-    const originalName = mediaMsg.fileName || `cv.${ext}`;
-    const cvId = await saveCV(session.data.pencariKerjaId, fileName, originalName, fileSize);
-    
-    // Save lamaran
-    await saveLamaran(session.data.lowonganId, session.data.pencariKerjaId, cvId);
-    
-    clearState(phoneNumber);
-    
-    await sock.sendMessage(from, { 
-      text: '✅ Lamaran kamu udah dikirim!\n\nStatus: Sedang diproses 📨\n\nTenang, nanti kami kabarin kalau ada update.\nGood luck ya! 🍀' 
-    });
-    
-  } catch (err) {
-    console.error('Error handling file upload:', err);
-    await sock.sendMessage(from, { 
-      text: 'Maaf, gagal upload CV. Coba lagi ya!' 
-    });
-    clearState(phoneNumber);
-  }
-}
-
-// Handle menu perusahaan
-async function handleCompanyMenu(sock, from, phoneNumber, text, userData) {
-  const session = getState(phoneNumber);
-  const lowerText = text.toLowerCase();
-  
-  // Jika sedang dalam flow tertentu
-  if (session) {
-    await handleCompanyFlowState(sock, from, phoneNumber, text, userData, session);
-    return;
-  }
-  
-  try {
-    if (lowerText === '1' || lowerText.includes('posting') || lowerText.includes('post')) {
-      // Mulai proses posting lowongan
+    if (lowerText === '1' || lowerText.includes('posting') || lowerText.includes('buat')) {
+      console.log(`📝 [${phoneNumber}] Starting posting lowongan flow`);
+      
+      // Mulai flow posting lowongan
+      setState(phoneNumber, 'post_loker_posisi', {});
+      console.log(`✅ [${phoneNumber}] State set to: post_loker_posisi`);
+      
       await sock.sendMessage(from, { 
         text: 'Oke, yuk bikin lowongan baru!\n\nPosisi apa yang mau dibuka?\n(contoh: Web Developer, Marketing Manager)' 
       });
-      setState(phoneNumber, 'post_loker_posisi', {});
       
-    } else if (lowerText === '2' || lowerText.includes('pelamar') || lowerText.includes('lamaran')) {
+      console.log(`✅ [${phoneNumber}] Welcome message sent`);
+      
+    } else if (lowerText === '2' || lowerText.includes('pelamar')) {
       // Lihat pelamar
       const perusahaanId = await getPerusahaanId(userData.id);
       const lowongan = await getCompanyLowongan(perusahaanId);
-      
-      if (lowongan.length === 0) {
-        await sock.sendMessage(from, { 
-          text: 'Kamu belum punya lowongan.\n\nYuk posting lowongan dulu! Ketik "1" atau "posting".' 
-        });
-        return;
-      }
-      
       const listText = formatCompanyLowonganList(lowongan);
       await sock.sendMessage(from, { text: listText });
+      
       setState(phoneNumber, 'choose_lowongan_pelamar', { lowongan });
       
     } else if (lowerText === '3' || lowerText.includes('kelola')) {
       // Kelola lowongan
       const perusahaanId = await getPerusahaanId(userData.id);
       const lowongan = await getCompanyLowongan(perusahaanId);
-      
-      if (lowongan.length === 0) {
-        await sock.sendMessage(from, { 
-          text: 'Kamu belum punya lowongan.\n\nYuk posting lowongan dulu! Ketik "1" atau "posting".' 
-        });
-        return;
-      }
-      
       const listText = formatCompanyLowonganList(lowongan);
       await sock.sendMessage(from, { text: listText });
+      
       setState(phoneNumber, 'choose_lowongan_kelola', { lowongan });
       
-    } else if (lowerText === 'menu' || lowerText === 'back' || lowerText === 'kembali') {
+    } else if (lowerText === 'menu' || lowerText === 'help') {
       await showMainMenu(sock, from, userData);
       
     } else {
-      await sock.sendMessage(from, { 
-        text: 'Maaf, aku nggak ngerti 😅\n\nKetik "menu" untuk lihat pilihan yang ada ya!' 
-      });
+      await sock.sendMessage(from, { text: 'Perintah tidak dikenali. Ketik "menu" untuk lihat pilihan.' });
     }
-  } catch (err) {
-    console.error('Error di handleCompanyMenu:', err);
-    await sock.sendMessage(from, { text: 'Maaf, ada error. Coba lagi ya!' });
   }
 }
 
-// Handle flow state perusahaan
-async function handleCompanyFlowState(sock, from, phoneNumber, text, userData, session) {
+// Handle state flow
+async function handleFlowState(sock, from, phoneNumber, text, userData, session) {
+  console.log(`🔀 [${phoneNumber}] handleFlowState called - state: ${session.state}, role: ${userData.role}`);
+  
+  if (userData.role === 'pencari_kerja') {
+    await handleJobSeekerFlowState(sock, from, phoneNumber, text, userData, session);
+  } else {
+    await handleCompanyFlowState(sock, from, phoneNumber, text, userData, session);
+  }
+}
+
+// Handle flow state untuk pencari kerja
+async function handleJobSeekerFlowState(sock, from, phoneNumber, text, userData, session) {
   try {
-    // Flow posting lowongan
+    if (session.state === 'choose_lowongan') {
+      // User pilih lowongan untuk lihat detail
+      const selectedIndex = parseInt(text) - 1;
+      const lowonganId = text.toUpperCase();
+      
+      let selectedLowongan;
+      
+      if (!isNaN(selectedIndex) && session.data.lowongan[selectedIndex]) {
+        selectedLowongan = session.data.lowongan[selectedIndex];
+      } else if (lowonganId.startsWith('LWG')) {
+        selectedLowongan = session.data.lowongan.find(l => l.id === lowonganId);
+      }
+      
+      if (!selectedLowongan) {
+        await sock.sendMessage(from, { text: 'Lowongan tidak ditemukan!' });
+        return;
+      }
+      
+      // Ambil detail lengkap
+      const lowonganDetail = await getLowonganDetail(selectedLowongan.id);
+      const detailText = formatLowonganDetail(lowonganDetail);
+      await sock.sendMessage(from, { text: detailText });
+      
+      clearState(phoneNumber);
+      
+    } else if (session.state === 'upload_cv') {
+      await sock.sendMessage(from, { 
+        text: 'Silakan kirim file CV kamu (PDF/DOC/DOCX, max 5MB)' 
+      });
+    }
+    
+  } catch (err) {
+    console.error(`❌ [${phoneNumber}] Error di handleJobSeekerFlowState:`, err.message);
+    console.error('Stack:', err.stack);
+    await sock.sendMessage(from, { text: `Maaf, ada error. Coba lagi ya!\n\n[Debug: ${err.message}]` });
+    clearState(phoneNumber);
+  }
+}
+
+// Handle file upload
+async function handleFileUpload(sock, from, phoneNumber, msg, messageType) {
+  const session = getState(phoneNumber);
+  
+  if (!session || session.state !== 'upload_cv') {
+    await sock.sendMessage(from, { text: 'File ini untuk apa ya? Kalau mau kirim CV, ketik "lamar [ID lowongan]" dulu.' });
+    return;
+  }
+  
+  try {
+    let buffer, mimetype, fileName;
+    
+    if (messageType === 'documentMessage') {
+      buffer = await downloadMediaMessage(msg, 'buffer', {});
+      mimetype = msg.message.documentMessage.mimetype;
+      fileName = msg.message.documentMessage.fileName;
+    } else {
+      await sock.sendMessage(from, { text: 'CV harus dalam format dokumen (PDF/DOC/DOCX)' });
+      return;
+    }
+    
+    // Validasi file type
+    if (!isValidFileType(mimetype)) {
+      await sock.sendMessage(from, { text: 'Format file tidak valid! Kirim PDF atau DOC/DOCX ya.' });
+      return;
+    }
+    
+    // Validasi file size
+    if (!isValidFileSize(buffer.length)) {
+      await sock.sendMessage(from, { text: 'File terlalu besar! Max 5MB ya.' });
+      return;
+    }
+    
+    // Simpan CV
+    const uploadDir = process.env.UPLOAD_DIR || './uploads/cv';
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    
+    const user = await checkUserExists(phoneNumber);
+    const savedFileName = generateFileName(fileName, user.id);
+    const filePath = path.join(uploadDir, savedFileName);
+    
+    fs.writeFileSync(filePath, buffer);
+    
+    // Simpan ke database (TANPA file_size)
+    const cvId = await saveCV(session.data.pencariKerjaId, savedFileName, fileName);
+    
+    // Simpan lamaran
+    const lamaranId = await saveLamaran(session.data.lowonganId, session.data.pencariKerjaId, cvId);
+    
+    clearState(phoneNumber);
+    
+    await sock.sendMessage(from, { 
+      text: `✅ Lamaran berhasil dikirim!\n\nPosisi: ${session.data.posisi}\nCV: ${fileName}\n\nTunggu kabar dari HRD ya! Good luck! 🍀` 
+    });
+    
+  } catch (err) {
+    console.error(`❌ [${phoneNumber}] Error upload CV:`, err.message);
+    console.error('Stack:', err.stack);
+    await sock.sendMessage(from, { text: `Gagal upload CV. Coba lagi ya!\n\n[Debug: ${err.message}]` });
+  }
+}
+
+// Handle flow state untuk perusahaan
+async function handleCompanyFlowState(sock, from, phoneNumber, text, userData, session) {
+  console.log(`🏢 [${phoneNumber}] handleCompanyFlowState - state: ${session.state}`);
+  console.log(`📊 [${phoneNumber}] Session data:`, JSON.stringify(session.data, null, 2));
+  
+  try {
     if (session.state === 'post_loker_posisi') {
+      console.log(`📝 [${phoneNumber}] Processing posisi: "${text}"`);
+      
+      // Simpan posisi, tanya deskripsi
       session.data.posisi = text;
       setState(phoneNumber, 'post_loker_deskripsi', session.data);
+      
+      console.log(`✅ [${phoneNumber}] Posisi saved, state updated to: post_loker_deskripsi`);
+      console.log(`📊 [${phoneNumber}] Updated session data:`, JSON.stringify(session.data, null, 2));
+      
       await sock.sendMessage(from, { 
-        text: 'Sip! Sekarang kasih deskripsi pekerjaannya dong.\n(jelasin tugas & tanggung jawabnya)' 
+        text: `Posisi: *${text}*\n\nSekarang, kasih deskripsi pekerjaan dong!\n(tulis detail job desc, tanggung jawab, dll)` 
       });
       
+      console.log(`✅ [${phoneNumber}] Deskripsi prompt sent`);
+      
     } else if (session.state === 'post_loker_deskripsi') {
+      console.log(`📝 [${phoneNumber}] Processing deskripsi: "${text.substring(0, 50)}..."`);
+      
+      // Simpan deskripsi, tanya lokasi
       session.data.deskripsi = text;
       setState(phoneNumber, 'post_loker_lokasi', session.data);
+      
+      console.log(`✅ [${phoneNumber}] Deskripsi saved, state updated to: post_loker_lokasi`);
+      
       await sock.sendMessage(from, { 
-        text: 'Mantap! Lokasinya di mana?\n(contoh: Jakarta, Bandung, Remote)\n\nAtau ketik "skip" kalau mau dilewat.' 
+        text: 'Deskripsi tersimpan!\n\nLokasi kerjanya di mana?\n(ketik nama kota/daerah, atau ketik "remote" kalau work from home)' 
       });
       
     } else if (session.state === 'post_loker_lokasi') {
-      if (text.toLowerCase() !== 'skip') {
-        session.data.lokasi = text;
-      }
+      console.log(`📝 [${phoneNumber}] Processing lokasi: "${text}"`);
+      
+      // Simpan lokasi, tanya skill
+      session.data.lokasi = text;
       setState(phoneNumber, 'post_loker_skill', session.data);
       
-      // Tampilkan list skill
-      const skills = await getAllSkills();
-      let skillText = 'Skill apa aja yang dibutuhin?\n\n';
-      skillText += 'Pilih dari list atau ketik manual (pisahin pake koma):\n\n';
-      skills.slice(0, 10).forEach((skill, index) => {
-        skillText += `${index + 1}. ${skill.nama_skill}\n`;
-      });
-      skillText += '\nContoh ketik: 1,2,3 atau JavaScript, PHP';
+      console.log(`✅ [${phoneNumber}] Lokasi saved, state updated to: post_loker_skill`);
       
-      await sock.sendMessage(from, { text: skillText });
+      await sock.sendMessage(from, { 
+        text: 'Noted!\n\nSkill apa aja yang dibutuhkan?\n\n(pisahkan pakai koma, contoh: JavaScript, PHP, MySQL)' 
+      });
       
     } else if (session.state === 'post_loker_skill') {
-      // Parse skill input
-      const skillIds = [];
-      const skillInput = text.split(',').map(s => s.trim());
+      console.log(`📝 [${phoneNumber}] Processing skill: "${text}"`);
       
-      for (const input of skillInput) {
-        const num = parseInt(input);
-        if (!isNaN(num)) {
-          // User ketik nomor, ambil dari list skill
-          const skills = await getAllSkills();
-          if (skills[num - 1]) {
-            skillIds.push(skills[num - 1].id);
-          }
-        } else {
-          // User ketik nama skill, cari atau buat baru
-          const skillId = await findOrCreateSkill(input);
+      const input = text.trim();
+      
+      if (!input) {
+        await sock.sendMessage(from, { text: 'Skill tidak boleh kosong! Tulis minimal 1 skill.' });
+        return;
+      }
+      
+      // Parse skill (pisah pakai koma, titik koma, atau enter)
+      const skillInput = input
+        .split(/[,;\n]+/)
+        .map(s => s.trim())
+        .filter(s => s.length > 0);
+      
+      console.log(`📝 [${phoneNumber}] Parsed skills:`, skillInput);
+      
+      if (skillInput.length === 0) {
+        await sock.sendMessage(from, { text: 'Format skill tidak valid! Pisahkan dengan koma ya.' });
+        return;
+      }
+      
+      // Cari atau buat skill
+      const skillIds = [];
+      for (const skillName of skillInput) {
+        try {
+          console.log(`🔍 [${phoneNumber}] Finding/creating skill: ${skillName}`);
+          const skillId = await findOrCreateSkill(skillName);
           skillIds.push(skillId);
+          console.log(`✅ [${phoneNumber}] Skill ${skillName} -> ${skillId}`);
+        } catch (err) {
+          console.error(`❌ [${phoneNumber}] Error creating skill ${skillName}:`, err.message);
+          throw err;
         }
       }
       
       session.data.skillIds = skillIds;
       setState(phoneNumber, 'post_loker_confirm', session.data);
       
+      console.log(`✅ [${phoneNumber}] Skills saved, state updated to: post_loker_confirm`);
+      console.log(`📊 [${phoneNumber}] Final session data before confirm:`, JSON.stringify(session.data, null, 2));
+      
       // Konfirmasi
       let confirmText = '📋 *Konfirmasi Lowongan*\n\n';
       confirmText += `Posisi: ${session.data.posisi}\n`;
-      confirmText += `Lokasi: ${session.data.lokasi || 'Tidak disebutkan'}\n`;
+      confirmText += `Deskripsi: ${session.data.deskripsi.substring(0, 100)}${session.data.deskripsi.length > 100 ? '...' : ''}\n`;
+      confirmText += `Lokasi: ${session.data.lokasi}\n`;
       confirmText += `Skill: ${skillInput.join(', ')}\n\n`;
       confirmText += 'Posting lowongan ini?\n\nKetik "ya" untuk posting atau "batal" untuk cancel.';
       
       await sock.sendMessage(from, { text: confirmText });
       
     } else if (session.state === 'post_loker_confirm') {
+      console.log(`📝 [${phoneNumber}] Processing confirmation: "${text}"`);
+      
       if (text.toLowerCase() === 'ya' || text.toLowerCase() === 'yes') {
-        // Simpan lowongan
+        console.log(`💾 [${phoneNumber}] User confirmed, saving lowongan...`);
+        console.log(`📊 [${phoneNumber}] Data to save:`, JSON.stringify(session.data, null, 2));
+        
         const perusahaanId = await getPerusahaanId(userData.id);
+        console.log(`🏢 [${phoneNumber}] Perusahaan ID: ${perusahaanId}`);
+        
         const lowonganId = await saveLowongan(perusahaanId, session.data);
+        console.log(`✅ [${phoneNumber}] Lowongan saved with ID: ${lowonganId}`);
+        
         await saveLowonganSkills(lowonganId, session.data.skillIds);
+        console.log(`✅ [${phoneNumber}] Skills linked to lowongan`);
         
         clearState(phoneNumber);
+        console.log(`✅ [${phoneNumber}] Session cleared`);
         
         await sock.sendMessage(from, { 
           text: `✅ Lowongan berhasil diposting!\n\nID: ${lowonganId}\nPosisi: ${session.data.posisi}\n\nSekarang kamu bisa tunggu pelamar masuk! 🎉` 
         });
+        
+        console.log(`✅ [${phoneNumber}] Success message sent`);
       } else {
         clearState(phoneNumber);
         await sock.sendMessage(from, { text: 'Posting lowongan dibatalkan.' });
       }
       
-    } else if (session.state === 'choose_lowongan_pelamar') {
-      // User pilih lowongan untuk lihat pelamar
-      const selectedIndex = parseInt(text) - 1;
-      const lowonganId = text.toUpperCase();
-      
-      let selectedLowongan;
-      
-      if (!isNaN(selectedIndex) && session.data.lowongan[selectedIndex]) {
-        selectedLowongan = session.data.lowongan[selectedIndex];
-      } else if (lowonganId.startsWith('LWG')) {
-        selectedLowongan = session.data.lowongan.find(l => l.id === lowonganId);
-      }
-      
-      if (!selectedLowongan) {
-        await sock.sendMessage(from, { text: 'Lowongan tidak ditemukan!' });
-        return;
-      }
-      
-      // Ambil pelamar
-      const applicants = await getLowonganApplicants(selectedLowongan.id);
-      const listText = formatApplicantsList(applicants, selectedLowongan.posisi);
-      await sock.sendMessage(from, { text: listText });
-      
-      setState(phoneNumber, 'choose_pelamar', { 
-        lowonganId: selectedLowongan.id,
-        applicants 
-      });
-      
-    } else if (session.state === 'choose_pelamar') {
-      // User pilih pelamar untuk lihat detail
-      const selectedIndex = parseInt(text) - 1;
-      const lamaranId = text.toUpperCase();
-      
-      let selectedApp;
-      
-      if (!isNaN(selectedIndex) && session.data.applicants[selectedIndex]) {
-        selectedApp = session.data.applicants[selectedIndex];
-      } else if (lamaranId.startsWith('LMR')) {
-        selectedApp = session.data.applicants.find(a => a.lamaran_id === lamaranId);
-      }
-      
-      if (!selectedApp) {
-        await sock.sendMessage(from, { text: 'Pelamar tidak ditemukan!' });
-        return;
-      }
-      
-      // Tampilkan detail pelamar
-      let detailText = `👤 *Detail Pelamar*\n\n`;
-      detailText += `Nama: ${selectedApp.nama_pelamar}\n`;
-      detailText += `Alamat: ${selectedApp.alamat}\n`;
-      detailText += `No HP: ${selectedApp.no_hp}\n`;
-      detailText += `Status: ${selectedApp.status}\n`;
-      detailText += `Tanggal Melamar: ${selectedApp.tanggal_melamar}\n\n`;
-      
-      if (selectedApp.file_cv) {
-        detailText += `📄 CV: ${selectedApp.original_filename}\n\n`;
-      }
-      
-      detailText += `━━━━━━━━━━━━━━━━━━━━\n`;
-      detailText += `Update status lamaran:\n\n`;
-      detailText += `Ketik:\n`;
-      detailText += `• *terima ${selectedApp.lamaran_id}* - Terima pelamar\n`;
-      detailText += `• *tolak ${selectedApp.lamaran_id}* - Tolak pelamar\n`;
-      detailText += `• *proses ${selectedApp.lamaran_id}* - Sedang diproses`;
-      
-      await sock.sendMessage(from, { text: detailText });
-      
-      // Kirim file CV kalau ada
-      if (selectedApp.file_cv) {
-        try {
-          const uploadDir = process.env.UPLOAD_DIR || './uploads/cv';
-          const filePath = path.join(uploadDir, selectedApp.file_cv);
-          
-          if (fs.existsSync(filePath)) {
-            await sock.sendMessage(from, {
-              document: fs.readFileSync(filePath),
-              fileName: selectedApp.original_filename,
-              mimetype: 'application/pdf'
-            });
-          }
-        } catch (err) {
-          console.error('Error sending CV:', err);
-        }
-      }
-      
-      clearState(phoneNumber);
-      
-    } else if (session.state === 'choose_lowongan_kelola') {
-      // User pilih lowongan untuk kelola
-      const selectedIndex = parseInt(text) - 1;
-      const lowonganId = text.toUpperCase();
-      
-      let selectedLowongan;
-      
-      if (!isNaN(selectedIndex) && session.data.lowongan[selectedIndex]) {
-        selectedLowongan = session.data.lowongan[selectedIndex];
-      } else if (lowonganId.startsWith('LWG')) {
-        selectedLowongan = session.data.lowongan.find(l => l.id === lowonganId);
-      }
-      
-      if (!selectedLowongan) {
-        await sock.sendMessage(from, { text: 'Lowongan tidak ditemukan!' });
-        return;
-      }
-      
-      // Tampilkan opsi kelola
-      const statusIcon = selectedLowongan.status === 'aktif' ? '🟢' : '🔴';
-      let text = `${statusIcon} *${selectedLowongan.posisi}*\n\n`;
-      text += `Status: ${selectedLowongan.status}\n`;
-      text += `Jumlah Pelamar: ${selectedLowongan.jumlah_pelamar}\n\n`;
-      text += `━━━━━━━━━━━━━━━━━━━━\n`;
-      text += `Kelola lowongan:\n\n`;
-      
-      if (selectedLowongan.status === 'aktif') {
-        text += `Ketik: *tutup ${selectedLowongan.id}* - Tutup lowongan`;
-      } else {
-        text += `Ketik: *aktifkan ${selectedLowongan.id}* - Aktifkan lowongan`;
-      }
-      
-      await sock.sendMessage(from, { text });
-      clearState(phoneNumber);
-    }
-    
-    // Handle update status lamaran
-    if (text.toLowerCase().startsWith('terima ') || 
-        text.toLowerCase().startsWith('tolak ') || 
-        text.toLowerCase().startsWith('proses ')) {
-      
-      const parts = text.split(' ');
-      const action = parts[0].toLowerCase();
-      const lamaranId = parts[1];
-      
-      let newStatus;
-      if (action === 'terima') newStatus = 'diterima';
-      else if (action === 'tolak') newStatus = 'ditolak';
-      else if (action === 'proses') newStatus = 'diproses';
-      
-      await updateLamaranStatus(lamaranId, newStatus);
-      
-      // Kirim notifikasi ke pelamar
-      const applicantInfo = await getApplicantInfo(lamaranId);
-      if (applicantInfo) {
-        const statusEmoji = {
-          'diterima': '✅',
-          'ditolak': '❌',
-          'diproses': '⏳'
-        };
-        
-        const notifText = `🔔 *Update Status Lamaran*\n\nLowongan: ${applicantInfo.posisi}\nPerusahaan: ${applicantInfo.nama_perusahaan}\n\nStatus: ${statusEmoji[newStatus]} ${newStatus.charAt(0).toUpperCase() + newStatus.slice(1)}\n\n${newStatus === 'diterima' ? 'Selamat! Kamu lolos seleksi.\nHRD akan menghubungi kamu segera untuk tahap selanjutnya.\n\nGood luck! 🎉' : newStatus === 'ditolak' ? 'Mohon maaf, kamu belum lolos seleksi kali ini.\nJangan menyerah, coba lamar lowongan lainnya ya! 💪' : 'Lamaran kamu sedang diproses.\nTunggu kabar selanjutnya ya!'}`;
-        
-        try {
-          await sock.sendMessage(`${applicantInfo.no_wa}@s.whatsapp.net`, {
-            text: notifText
-          });
-        } catch (err) {
-          console.error('Error sending notification:', err);
-        }
-      }
-      
-      await sock.sendMessage(from, { 
-        text: `✅ Status lamaran berhasil diupdate jadi "${newStatus}"!\n\nNotifikasi sudah dikirim ke pelamar.` 
-      });
-    }
-    
-    // Handle tutup/aktifkan lowongan
-    if (text.toLowerCase().startsWith('tutup ') || text.toLowerCase().startsWith('aktifkan ')) {
-      const parts = text.split(' ');
-      const action = parts[0].toLowerCase();
-      const lowonganId = parts[1];
-      
-      const newStatus = action === 'tutup' ? 'tutup' : 'aktif';
-      await updateLowonganStatus(lowonganId, newStatus);
-      
-      await sock.sendMessage(from, { 
-        text: `✅ Lowongan berhasil di${action}!` 
-      });
+    } else {
+      console.log(`⚠️ [${phoneNumber}] Unknown state: ${session.state}`);
     }
     
   } catch (err) {
-    console.error('Error di handleCompanyFlowState:', err);
-    await sock.sendMessage(from, { text: 'Maaf, ada error. Coba lagi ya!' });
+    console.error(`❌ [${phoneNumber}] Error di handleCompanyFlowState:`);
+    console.error('Error:', err.message);
+    console.error('Stack:', err.stack);
+    await sock.sendMessage(from, { text: `Maaf, ada error. Coba lagi ya!\n\n[Debug: ${err.message}]` });
     clearState(phoneNumber);
   }
 }

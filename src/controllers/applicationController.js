@@ -14,7 +14,7 @@ async function checkExistingApplication(pencariKerjaId, lowonganId) {
 }
 
 // Simpan CV ke database
-async function saveCV(pencariKerjaId, fileName, originalName, fileSize) {
+async function saveCV(pencariKerjaId, fileName, originalName) {
   try {
     // Cek apakah sudah ada CV
     const existingCV = await query(
@@ -25,8 +25,8 @@ async function saveCV(pencariKerjaId, fileName, originalName, fileSize) {
     if (existingCV.length > 0) {
       // Update CV yang sudah ada
       await query(
-        'UPDATE cv SET file_cv = ?, original_filename = ?, file_size = ?, updated_at = NOW() WHERE id = ?',
-        [fileName, originalName, fileSize, existingCV[0].id]
+        'UPDATE cv SET file_cv = ?, original_filename = ?, updated_at = NOW() WHERE id = ?',
+        [fileName, originalName, existingCV[0].id]
       );
       return existingCV[0].id;
     } else {
@@ -35,8 +35,8 @@ async function saveCV(pencariKerjaId, fileName, originalName, fileSize) {
       const cvId = generateId('CV', lastCV[0]?.id);
       
       await query(
-        'INSERT INTO cv (id, pencari_kerja_id, file_cv, original_filename, file_size) VALUES (?, ?, ?, ?, ?)',
-        [cvId, pencariKerjaId, fileName, originalName, fileSize]
+        'INSERT INTO cv (id, pencari_kerja_id, file_cv, original_filename) VALUES (?, ?, ?, ?)',
+        [cvId, pencariKerjaId, fileName, originalName]
       );
       return cvId;
     }

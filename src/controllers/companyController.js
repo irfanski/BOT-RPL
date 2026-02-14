@@ -26,6 +26,14 @@ async function saveLowongan(perusahaanId, data) {
     const lastLowongan = await query('SELECT id FROM lowongan ORDER BY id DESC LIMIT 1');
     const lowonganId = generateId('LWG', lastLowongan[0]?.id);
     
+    console.log('💾 Saving lowongan:', {
+      lowonganId,
+      perusahaanId,
+      posisi: data.posisi,
+      deskripsi: data.deskripsi ? data.deskripsi.substring(0, 50) + '...' : null,
+      lokasi: data.lokasi
+    });
+    
     await query(
       `INSERT INTO lowongan 
        (id, perusahaan_id, posisi, deskripsi, lokasi, tipe_pekerjaan, gaji_min, gaji_max, status) 
@@ -42,27 +50,42 @@ async function saveLowongan(perusahaanId, data) {
       ]
     );
     
+    console.log('✅ Lowongan saved successfully:', lowonganId);
     return lowonganId;
   } catch (err) {
-    console.error('Error saving lowongan:', err);
+    console.error('❌ Error saving lowongan:', err);
+    console.error('Error detail:', err.message);
+    console.error('Stack:', err.stack);
     throw err;
   }
 }
 
-// Simpan skill untuk lowongan
+// Simpan skill untuk lowongan - FIXED VERSION
 async function saveLowonganSkills(lowonganId, skillIds) {
   try {
-    for (const skillId of skillIds) {
-      const lastLS = await query('SELECT id FROM lowongan_skill ORDER BY id DESC LIMIT 1');
-      const lsId = generateId('LSK', lastLS[0]?.id);
+    console.log(`💾 Saving ${skillIds.length} skills for lowongan ${lowonganId}`);
+    
+    // Ambil last ID sekali di awal
+    const lastLS = await query('SELECT id FROM lowongan_skill ORDER BY id DESC LIMIT 1');
+    let lastNum = lastLS[0]?.id ? parseInt(lastLS[0].id.replace('LSK', '')) : 0;
+    
+    // Loop dan increment manual
+    for (let i = 0; i < skillIds.length; i++) {
+      lastNum++;
+      const lsId = `LSK${lastNum.toString().padStart(3, '0')}`;
+      
+      console.log(`  ↳ Linking skill ${skillIds[i]} → ${lsId}`);
       
       await query(
         'INSERT INTO lowongan_skill (id, lowongan_id, skill_id) VALUES (?, ?, ?)',
-        [lsId, lowonganId, skillId]
+        [lsId, lowonganId, skillIds[i]]
       );
     }
+    
+    console.log('✅ All skills linked successfully');
   } catch (err) {
-    console.error('Error saving lowongan skills:', err);
+    console.error('❌ Error saving lowongan skills:', err);
+    console.error('Error detail:', err.message);
     throw err;
   }
 }
@@ -76,13 +99,19 @@ async function getAllSkills() {
 // Cari atau buat skill baru
 async function findOrCreateSkill(skillName) {
   try {
-    // Cek apakah skill sudah ada
+    // Normalize skill name (trim dan lowercase untuk comparison)
+    const normalizedName = skillName.trim();
+    
+    console.log(`🔍 Finding/creating skill: "${normalizedName}"`);
+    
+    // Cek apakah skill sudah ada (case-insensitive)
     const existing = await query(
-      'SELECT id FROM skill WHERE nama_skill = ?',
-      [skillName]
+      'SELECT id FROM skill WHERE LOWER(nama_skill) = LOWER(?)',
+      [normalizedName]
     );
     
     if (existing.length > 0) {
+      console.log(`  ↳ Skill exists: ${existing[0].id}`);
       return existing[0].id;
     }
     
@@ -92,12 +121,14 @@ async function findOrCreateSkill(skillName) {
     
     await query(
       'INSERT INTO skill (id, nama_skill) VALUES (?, ?)',
-      [skillId, skillName]
+      [skillId, normalizedName]
     );
     
+    console.log(`  ↳ Skill created: ${skillId}`);
     return skillId;
   } catch (err) {
-    console.error('Error find or create skill:', err);
+    console.error('❌ Error find or create skill:', err);
+    console.error('Error detail:', err.message);
     throw err;
   }
 }
@@ -138,7 +169,7 @@ async function updateLamaranStatus(lamaranId, newStatus, catatan = null) {
     await query(sql, params);
     return true;
   } catch (err) {
-    console.error('Error updating lamaran status:', err);
+    console.error('❌ Error updating lamaran status:', err);
     throw err;
   }
 }
@@ -172,7 +203,7 @@ async function updateLowonganStatus(lowonganId, newStatus) {
     );
     return true;
   } catch (err) {
-    console.error('Error updating lowongan status:', err);
+    console.error('❌ Error updating lowongan status:', err);
     throw err;
   }
 }
@@ -204,7 +235,7 @@ function formatApplicantsList(applicants, posisi) {
     return `Belum ada yang lamar posisi *${posisi}*.\n\nTunggu sebentar lagi ya!`;
   }
   
-  let text = `📥 *Pelamar untuk ${posisi}*\n\n`;
+  let text = `🔥 *Pelamar untuk ${posisi}*\n\n`;
   text += `Total: ${applicants.length} orang\n\n`;
   
   applicants.forEach((app, index) => {
